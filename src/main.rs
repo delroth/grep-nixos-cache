@@ -222,12 +222,16 @@ async fn main() {
         .unwrap();
 
     let futures = paths.iter().map(|p| {
+        let p = p.clone();
         let http = http.clone();
         let needle = flags.needle.clone();
         async move {
-            find_needle_in_path(&needle, &p, &http, &url_base)
-                .await
-                .with_context(|| format!("Error while analyzing path {:?}", p))
+            tokio::spawn(async move {
+                find_needle_in_path(&needle, &p, &http, &url_base)
+                    .await
+                    .with_context(|| format!("Error while analyzing path {:?}", p))
+            })
+            .await?
         }
     });
 
