@@ -111,16 +111,22 @@ fn parse_narinfo(text: String) -> Result<NarInfo> {
     })
 }
 
-async fn fetch_narinfo(http: &reqwest::Client, url_base: &str, hash: &String) -> Result<NarInfo> {
+async fn fetch_narinfo(
+    http: &reqwest::Client,
+    url_base: &str,
+    hash: &String,
+) -> Result<Option<NarInfo>> {
     let url = format!("{}/{}.narinfo", url_base, hash);
-    let resp = http
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    parse_narinfo(resp).context("Could not parse narinfo file")
+    let resp = http.get(url).send().await?;
+
+    if resp.status().as_u16() == 403 {
+        return Ok(None);
+    }
+
+    let data = resp.text().await?;
+    Ok(Some(
+        parse_narinfo(data).context("Could not parse narinfo file")?,
+    ))
 }
 
 async fn fetch_nar(
@@ -159,20 +165,24 @@ async fn find_needle_in_path(
     let narinfo = fetch_narinfo(http, url_base, &hash)
         .await
         .context("Failed to fetch narinfo")?;
-    let nar = fetch_nar(http, url_base, narinfo)
-        .await
-        .context("Failed to fetch nar")?;
-
-    let searcher = memmem::TwoWaySearcher::new(needle.as_bytes());
 
     let mut files_matched = Vec::new();
-    for entry in nar.entries()? {
-        let entry = entry.context("Failed to parse NAR entry")?;
-        if let nix_nar::Content::File { mut data, size, .. } = entry.content {
-            let mut bytes = Vec::with_capacity(size.try_into().unwrap());
-            data.read_to_end(&mut bytes)?;
-            if searcher.search_in(bytes.as_slice()).is_some() {
-                files_matched.push(entry.path.unwrap().into_string());
+
+    if let Some(narinfo) = narinfo {
+        let nar = fetch_nar(http, url_base, narinfo)
+            .await
+            .context("Failed to fetch nar")?;
+
+        let searcher = memmem::TwoWaySearcher::new(needle.as_bytes());
+
+        for entry in nar.entries()? {
+            let entry = entry.context("Failed to parse NAR entry")?;
+            if let nix_nar::Content::File { mut data, size, .. } = entry.content {
+                let mut bytes = Vec::with_capacity(size.try_into().unwrap());
+                data.read_to_end(&mut bytes)?;
+                if searcher.search_in(bytes.as_slice()).is_some() {
+                    files_matched.push(entry.path.unwrap().into_string());
+                }
             }
         }
     }
