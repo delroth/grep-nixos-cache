@@ -36,7 +36,7 @@ struct Flags {
     hydra_eval_url: Option<String>,
 
     /// Number of simultaneous store paths to process in flight.
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 15)]
     parallelism: usize,
 }
 
