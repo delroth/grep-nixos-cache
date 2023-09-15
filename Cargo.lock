@@ -81,19 +81,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4668cab20f66d8d020e1fbc0ebe47217433c1b6c8f2040faf858554e394ace6"
 
 [[package]]
-name = "async-compression"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb42b2197bf15ccb092b62c74515dbd8b86d0effd934795f6687c93b6e679a2c"
-dependencies = [
- "futures-core",
- "futures-io",
- "memchr",
- "pin-project-lite",
- "xz2",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -792,14 +779,15 @@ name = "grep-nixos-cache"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-compression",
  "aws-config",
+ "bytes",
  "clap",
  "futures",
  "memmem",
  "nix-nar",
  "reqwest",
  "tokio",
+ "xz2",
 ]
 
 [[package]]

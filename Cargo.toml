@@ -8,11 +8,12 @@ authors = ["Pierre Bourdon <delroth@gmail.com>"]
 
 [dependencies]
 anyhow = "1.0.75"
-async-compression = { version = "0.4.3", features = ["xz", "futures-io"] }
 aws-config = "0.56.1"
+bytes = "1.5.0"
 clap = { version = "4.4.3", features = ["derive"]}
 futures = "0.3.28"
 memmem = "0.1.1"
 nix-nar = "0.3.0"
 reqwest = { version = "0.11.20", features = ["stream"] }
 tokio = { version = "1.32.0", features = ["full"]}
+xz2 = "0.1.7"

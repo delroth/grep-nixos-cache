@@ -1,8 +1,7 @@
 use anyhow::{bail, Context, Result};
-use async_compression::futures::bufread::XzDecoder;
 use aws_config::imds::region::ImdsRegionProvider;
+use bytes::buf::Buf;
 use clap::Parser;
-use futures::io::BufReader;
 use futures::prelude::*;
 use memmem::Searcher;
 use std::{
@@ -124,38 +123,29 @@ async fn fetch_narinfo(http: &reqwest::Client, url_base: &str, hash: &String) ->
     parse_narinfo(resp).context("Could not parse narinfo file")
 }
 
-fn decompress_stream(stream: impl AsyncBufRead, method: &String) -> Result<impl AsyncBufRead> {
-    Ok(BufReader::new(match method.as_str() {
-        "xz" => XzDecoder::new(stream),
-        _ => bail!("Unknown compression method: {}", method),
-    }))
-}
-
 async fn fetch_nar(
     http: &reqwest::Client,
     url_base: &str,
     narinfo: NarInfo,
 ) -> Result<nix_nar::Decoder<impl io::Read>> {
+    // TODO: This buffers everything into memory. Unfortunately there's no NAR parser right now
+    // which can deal with async decoding...
+
     let url = format!("{}/{}", url_base, narinfo.nar_url);
-    let stream = http
+    let compressed = http
         .get(url)
         .send()
         .await?
         .error_for_status()?
-        .bytes_stream()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-        .into_async_read();
+        .bytes()
+        .await?;
 
-    let mut decompressed = decompress_stream(BufReader::new(stream), &narinfo.compression)
-        .context("Could not build stream decompressor")?;
-
-    // TODO: This buffers the whole decompressed data into memory. Unfortunately there's no NAR
-    // parser right now which can deal with async decoding...
     let mut contents = Vec::with_capacity(narinfo.nar_size);
-    decompressed
-        .read_to_end(&mut contents)
-        .await
-        .context("Error while streaming decompressed data")?;
+    match narinfo.compression.as_str() {
+        "xz" => xz2::bufread::XzDecoder::new(compressed.reader()).read_to_end(&mut contents)?,
+        _ => bail!("Unknown compression method: {}", narinfo.compression),
+    };
+
     Ok(nix_nar::Decoder::new(io::Cursor::new(contents)).context("Not a valid NAR file")?)
 }
 
