@@ -24,7 +24,8 @@
         };
 
         devShell = pkgs.mkShell {
-          nativeBuildInputs = with pkgs; [ rustc cargo ];
+          nativeBuildInputs = with pkgs; [ rustc cargo pkg-config ];
+          buildInputs = with pkgs; [ openssl ];
         };
       }
     );
