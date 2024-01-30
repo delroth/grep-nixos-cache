@@ -12,8 +12,8 @@ use std::{
 };
 
 const PATHS_COUNT_AWS_THRESHOLD: usize = 50;
-const NIX_CACHE_S3_BASE: &str = "https://nix-cache.s3.amazonaws.com";
-const NIX_CACHE_CDN_BASE: &str = "https://cache.nixos.org";
+const NIX_CACHE_S3_BUCKET: &str = "nix-cache";
+const NIX_CACHE_CDN_URL: &str = "https://cache.nixos.org";
 const NIX_CACHE_REGION: &str = "us-east-1";
 const USER_AGENT: &str = "grep-nixos-cache 1.0 (https://github.com/delroth/grep-nixos-cache)";
 const YARA_TIMEOUT_SECS: i32 = 30;
@@ -44,6 +44,10 @@ struct Flags {
     /// Number of simultaneous store paths to process in flight.
     #[arg(long, default_value_t = 15)]
     parallelism: usize,
+
+    /// Allow possibly expensive runs fetching from S3 with requester-pays.
+    #[arg(long, default_value_t = false)]
+    allow_possibly_expensive_run: bool,
 }
 
 async fn get_aws_region() -> Option<String> {
@@ -126,6 +130,68 @@ impl Matcher<'_> {
     }
 }
 
+#[derive(Clone)]
+enum Fetcher {
+    Cdn(CdnFetcher),
+    S3(S3Fetcher),
+}
+
+#[derive(Clone)]
+struct CdnFetcher {
+    client: reqwest::Client,
+    url_base: String,
+}
+
+#[derive(Clone)]
+struct S3Fetcher {
+    client: aws_sdk_s3::Client,
+    bucket: String,
+}
+
+impl CdnFetcher {
+    fn new(url_base: &str) -> CdnFetcher {
+        CdnFetcher {
+            client: reqwest::Client::builder()
+                .user_agent(USER_AGENT)
+                .build()
+                .unwrap(),
+            url_base: url_base.to_string(),
+        }
+    }
+}
+
+impl S3Fetcher {
+    fn new(config: &aws_config::SdkConfig, bucket: &str) -> S3Fetcher {
+        S3Fetcher {
+            client: aws_sdk_s3::Client::new(config),
+            bucket: bucket.to_string(),
+        }
+    }
+}
+
+impl Fetcher {
+    async fn download(&self, path: &str) -> Result<(u16, bytes::Bytes)> {
+        match self {
+            Fetcher::Cdn(cf) => {
+                let url = format!("{}/{}", cf.url_base, path);
+                let resp = cf.client.get(url).send().await?;
+                Ok((resp.status().as_u16(), resp.bytes().await?))
+            }
+            Fetcher::S3(sf) => {
+                let resp = sf
+                    .client
+                    .get_object()
+                    .bucket(&sf.bucket)
+                    .request_payer(aws_sdk_s3::types::RequestPayer::Requester)
+                    .key(path)
+                    .send()
+                    .await?;
+                Ok((200, resp.body.collect().await?.into_bytes()))
+            }
+        }
+    }
+}
+
 struct SearchOutcome {
     path: String,
     files_matched: multimap::MultiMap<String, String>,
@@ -170,40 +236,25 @@ fn parse_narinfo(text: String) -> Result<NarInfo> {
     })
 }
 
-async fn fetch_narinfo(
-    http: &reqwest::Client,
-    url_base: &str,
-    hash: &String,
-) -> Result<Option<NarInfo>> {
-    let url = format!("{}/{}.narinfo", url_base, hash);
-    let resp = http.get(url).send().await?;
+async fn fetch_narinfo(fetcher: &Fetcher, hash: &String) -> Result<Option<NarInfo>> {
+    let path = format!("{}.narinfo", hash);
+    let (code, body) = fetcher.download(&path).await?;
 
-    if resp.status().as_u16() == 403 {
+    if code == 403 {
         return Ok(None);
     }
 
-    let data = resp.text().await?;
+    let data = std::str::from_utf8(&body)?.to_string();
     Ok(Some(
         parse_narinfo(data).context("Could not parse narinfo file")?,
     ))
 }
 
-async fn fetch_nar(
-    http: &reqwest::Client,
-    url_base: &str,
-    narinfo: NarInfo,
-) -> Result<nix_nar::Decoder<impl io::Read>> {
+async fn fetch_nar(fetcher: &Fetcher, narinfo: NarInfo) -> Result<nix_nar::Decoder<impl io::Read>> {
     // TODO: This buffers everything into memory. Unfortunately there's no NAR parser right now
     // which can deal with async decoding...
 
-    let url = format!("{}/{}", url_base, narinfo.nar_url);
-    let compressed = http
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
+    let (_, compressed) = fetcher.download(&narinfo.nar_url).await?;
 
     let mut contents = Vec::with_capacity(narinfo.nar_size);
     match narinfo.compression.as_str() {
@@ -216,19 +267,18 @@ async fn fetch_nar(
 
 async fn find_matches_in_path(
     matcher: &Matcher<'_>,
+    fetcher: &Fetcher,
     path: &String,
-    http: &reqwest::Client,
-    url_base: &str,
 ) -> Result<SearchOutcome> {
     let hash = hash_from_path(path).with_context(|| format!("Failed to parse path: {}", path))?;
-    let narinfo = fetch_narinfo(http, url_base, &hash)
+    let narinfo = fetch_narinfo(fetcher, &hash)
         .await
         .context("Failed to fetch narinfo")?;
 
     let mut files_matched = multimap::MultiMap::<String, String>::new();
 
     if let Some(narinfo) = narinfo {
-        let nar = fetch_nar(http, url_base, narinfo)
+        let nar = fetch_nar(fetcher, narinfo)
             .await
             .context("Failed to fetch nar")?;
 
@@ -254,24 +304,25 @@ async fn find_matches_in_path(
 async fn main() {
     let flags = Flags::parse();
 
-    let mut url_base = NIX_CACHE_CDN_BASE;
     let paths = collect_output_paths(&flags);
 
-    if paths.is_empty() {
+    let fetcher = if paths.is_empty() {
         println!("No paths to check, exiting");
         process::exit(1);
     } else if paths.len() >= PATHS_COUNT_AWS_THRESHOLD {
-        println!(
-            "More than {} paths to check, ensuring that we run co-located with the Nix cache...",
-            PATHS_COUNT_AWS_THRESHOLD
-        );
-        if get_aws_region().await.unwrap_or("not-aws".to_string()) != NIX_CACHE_REGION {
-            println!("To avoid unnecessary costs to the NixOS project, please run this program in the AWS {} region. Exiting.", NIX_CACHE_REGION);
+        if !flags.allow_possibly_expensive_run
+            && get_aws_region().await.unwrap_or("not-aws".to_string()) != NIX_CACHE_REGION
+        {
+            println!("To avoid unnecessary costs, please run this program in the AWS {} region. Exiting.", NIX_CACHE_REGION);
+            println!("This behavior can be overridden with --allow-possibly-expensive-run.");
             process::exit(1);
         } else {
-            url_base = NIX_CACHE_S3_BASE;
+            let aws_config = aws_config::load_from_env().await;
+            Fetcher::S3(S3Fetcher::new(&aws_config, NIX_CACHE_S3_BUCKET))
         }
-    }
+    } else {
+        Fetcher::Cdn(CdnFetcher::new(NIX_CACHE_CDN_URL))
+    };
 
     let matcher = if let Some(needle) = flags.needle {
         let needle = Box::leak(Box::new(needle));
@@ -283,18 +334,13 @@ async fn main() {
         process::exit(1);
     };
 
-    let http = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .build()
-        .unwrap();
-
     let futures = paths.iter().map(|p| {
-        let p = p.clone();
-        let http = http.clone();
         let matcher = matcher.clone();
+        let fetcher = fetcher.clone();
+        let p = p.clone();
         async move {
             tokio::spawn(async move {
-                find_matches_in_path(&matcher, &p, &http, &url_base)
+                find_matches_in_path(&matcher, &fetcher, &p)
                     .await
                     .with_context(|| format!("Error while analyzing path {:?}", p))
             })
