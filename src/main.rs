@@ -8,6 +8,7 @@ use std::{
     fs,
     io::{self, Read},
     process,
+    sync::Arc,
 };
 
 const PATHS_COUNT_AWS_THRESHOLD: usize = 50;
@@ -15,13 +16,18 @@ const NIX_CACHE_S3_BASE: &str = "https://nix-cache.s3.amazonaws.com";
 const NIX_CACHE_CDN_BASE: &str = "https://cache.nixos.org";
 const NIX_CACHE_REGION: &str = "us-east-1";
 const USER_AGENT: &str = "grep-nixos-cache 1.0 (https://github.com/delroth/grep-nixos-cache)";
+const YARA_TIMEOUT_SECS: i32 = 30;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 struct Flags {
     /// String to look for in the target Nix store paths.
-    #[arg(long)]
-    needle: String,
+    #[arg(long, conflicts_with_all = ["yara_ruleset"])]
+    needle: Option<String>,
+
+    // Yara rules file to match against Nix store paths.
+    #[arg(long, conflicts_with_all = ["needle"])]
+    yara_ruleset: Option<String>,
 
     /// Single Nix store path that need to be checked (mostly for testing purposes).
     #[arg(long, conflicts_with_all = ["paths", "hydra_eval_url"])]
@@ -67,9 +73,62 @@ fn collect_output_paths(flags: &Flags) -> Vec<String> {
     }
 }
 
+#[derive(Clone)]
+enum Matcher<'a> {
+    String(StringMatcher<'a>),
+    Yara(YaraMatcher),
+}
+
+#[derive(Clone)]
+struct StringMatcher<'a> {
+    searcher: memmem::TwoWaySearcher<'a>,
+}
+
+impl StringMatcher<'_> {
+    fn new<'a>(needle: &'static String) -> StringMatcher<'a> {
+        StringMatcher {
+            searcher: memmem::TwoWaySearcher::new(needle.as_bytes()),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct YaraMatcher {
+    rules: Arc<yara::Rules>,
+}
+
+impl YaraMatcher {
+    fn new(rules_file: &String) -> Result<YaraMatcher> {
+        let compiler = yara::Compiler::new()?.add_rules_file(rules_file)?;
+        let rules = compiler.compile_rules()?;
+
+        Ok(YaraMatcher {
+            rules: Arc::new(rules),
+        })
+    }
+}
+
+impl Matcher<'_> {
+    fn matches(&self, haystack: &[u8]) -> Result<Vec<String>> {
+        match self {
+            Matcher::String(sm) => {
+                if sm.searcher.search_in(haystack).is_some() {
+                    Ok(vec!["needle".to_string()])
+                } else {
+                    Ok(vec![])
+                }
+            }
+            Matcher::Yara(ym) => {
+                let matches = ym.rules.scan_mem(haystack, YARA_TIMEOUT_SECS)?;
+                Ok(matches.iter().map(|r| r.identifier.to_string()).collect())
+            }
+        }
+    }
+}
+
 struct SearchOutcome {
     path: String,
-    files_matched: Vec<String>,
+    files_matched: multimap::MultiMap<String, String>,
 }
 
 struct NarInfo {
@@ -155,8 +214,8 @@ async fn fetch_nar(
     Ok(nix_nar::Decoder::new(io::Cursor::new(contents)).context("Not a valid NAR file")?)
 }
 
-async fn find_needle_in_path(
-    needle: &String,
+async fn find_matches_in_path(
+    matcher: &Matcher<'_>,
     path: &String,
     http: &reqwest::Client,
     url_base: &str,
@@ -166,22 +225,20 @@ async fn find_needle_in_path(
         .await
         .context("Failed to fetch narinfo")?;
 
-    let mut files_matched = Vec::new();
+    let mut files_matched = multimap::MultiMap::<String, String>::new();
 
     if let Some(narinfo) = narinfo {
         let nar = fetch_nar(http, url_base, narinfo)
             .await
             .context("Failed to fetch nar")?;
 
-        let searcher = memmem::TwoWaySearcher::new(needle.as_bytes());
-
         for entry in nar.entries()? {
             let entry = entry.context("Failed to parse NAR entry")?;
             if let nix_nar::Content::File { mut data, size, .. } = entry.content {
                 let mut bytes = Vec::with_capacity(size.try_into().unwrap());
                 data.read_to_end(&mut bytes)?;
-                if searcher.search_in(bytes.as_slice()).is_some() {
-                    files_matched.push(entry.path.unwrap().into_string());
+                for tag in matcher.matches(bytes.as_slice())?.iter() {
+                    files_matched.insert(entry.path.clone().unwrap().into_string(), tag.clone());
                 }
             }
         }
@@ -216,6 +273,16 @@ async fn main() {
         }
     }
 
+    let matcher = if let Some(needle) = flags.needle {
+        let needle = Box::leak(Box::new(needle));
+        Matcher::String(StringMatcher::new(needle))
+    } else if let Some(ruleset) = flags.yara_ruleset {
+        Matcher::Yara(YaraMatcher::new(&ruleset).expect("Failed to parse Yara ruleset"))
+    } else {
+        println!("No matcher provided, please use either --needle or --yara_ruleset");
+        process::exit(1);
+    };
+
     let http = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .build()
@@ -224,10 +291,10 @@ async fn main() {
     let futures = paths.iter().map(|p| {
         let p = p.clone();
         let http = http.clone();
-        let needle = flags.needle.clone();
+        let matcher = matcher.clone();
         async move {
             tokio::spawn(async move {
-                find_needle_in_path(&needle, &p, &http, &url_base)
+                find_matches_in_path(&matcher, &p, &http, &url_base)
                     .await
                     .with_context(|| format!("Error while analyzing path {:?}", p))
             })

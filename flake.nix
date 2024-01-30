@@ -19,13 +19,17 @@
         defaultPackage = naersk'.buildPackage {
           src = ./.;
 
-          nativeBuildInputs = with pkgs; [ pkg-config ];
-          buildInputs = with pkgs; [ openssl ];
+          env.YARA_INCLUDE_DIR = "${pkgs.lib.getDev pkgs.yara}/include";
+
+          nativeBuildInputs = with pkgs; [ rustPlatform.bindgenHook pkg-config ];
+          buildInputs = with pkgs; [ openssl yara ];
         };
 
         devShell = pkgs.mkShell {
-          nativeBuildInputs = with pkgs; [ rustc cargo pkg-config ];
-          buildInputs = with pkgs; [ openssl ];
+          env.YARA_INCLUDE_DIR = "${pkgs.lib.getDev pkgs.yara}/include";
+
+          nativeBuildInputs = with pkgs; [ rustc rustfmt cargo rustPlatform.bindgenHook pkg-config ];
+          buildInputs = with pkgs; [ openssl yara ];
         };
       }
     );
