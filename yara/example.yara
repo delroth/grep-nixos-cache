@@ -39,3 +39,10 @@ rule contains_libjpeg {
   condition:
     $sig
 }
+
+rule contains_libcurl {
+  strings:
+    $sig = "A libcurl function was given a bad argument"
+  condition:
+    $sig
+}
